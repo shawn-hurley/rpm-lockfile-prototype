@@ -8,6 +8,7 @@ import platform
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -33,6 +34,19 @@ from .containerfile_packages import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def log_timing(phase, started, arch="all", attempt="first"):
+    """Emit phase timings for the optional workload benchmark."""
+    if os.getenv("RPM_LOCKFILE_PROTOTYPE_TIMING"):
+        logger.info(
+            "TIMING phase=%s arch=%s attempt=%s seconds=%.3f",
+            phase,
+            arch,
+            attempt,
+            time.perf_counter() - started,
+        )
+
 
 CONTAINERFILE_HELP = """
 Load installed packages from base image specified in Containerfile and make
@@ -148,6 +162,8 @@ def resolver(
     packages = set()
     sources = set()
     module_metadata = []
+    attempt = "filelists" if download_filelists else "first"
+    phase_started = time.perf_counter()
 
     with tempfile.TemporaryDirectory() as cache_dir, dnf.Base() as base:
         # Configure base
@@ -197,7 +213,11 @@ def resolver(
                 conf,
                 baseurl=[f"file://{repo_path}"],
             )
-        base.fill_sack(load_system_repo=True)
+        try:
+            base.fill_sack(load_system_repo=True)
+        finally:
+            log_timing("metadata", phase_started, arch, attempt)
+        phase_started = time.perf_counter()
 
         if match_context_versions:
             solvables = utils.pin_context_versions(
@@ -252,6 +272,9 @@ def resolver(
                 # dependencies needed to validate the transaction.
                 raise MissingFilelists()
             raise
+        finally:
+            log_timing("solve", phase_started, arch, attempt)
+        phase_started = time.perf_counter()
 
         modular_packages = {
             nevra
@@ -297,6 +320,8 @@ def resolver(
                 }
             )
 
+        log_timing("collect", phase_started, arch, attempt)
+
     return packages, sources, module_metadata
 
 
@@ -304,8 +329,12 @@ def rpmdb_preparer(func=None):
     @contextlib.contextmanager
     def worker(arch):
         with tempfile.TemporaryDirectory() as root_dir:
-            if func:
-                func(root_dir, arch)
+            started = time.perf_counter()
+            try:
+                if func:
+                    func(root_dir, arch)
+            finally:
+                log_timing("rpmdb", started, arch)
             yield root_dir
 
     return worker
@@ -344,33 +373,37 @@ def process_arch(
     match_context_versions: list[str] | None = None,
 ):
     logger.info("Running solver for %s", arch)
+    arch_started = time.perf_counter()
 
-    with rpmdb(arch) as root_dir:
-        for download_filelists in [False, True]:
-            try:
-                packages, sources, module_metadata = resolver(
-                    arch,
-                    root_dir,
-                    repos,
-                    packages,
-                    allow_erasing,
-                    reinstall_packages,
-                    module_enable,
-                    module_disable,
-                    no_sources,
-                    install_weak_deps,
-                    upgrade_packages,
-                    download_filelists=download_filelists,
-                    zchunk=zchunk,
-                    assume_provides=assume_provides,
-                    match_context_versions=match_context_versions,
-                )
-                break
-            except MissingFilelists:
-                logger.error(
-                    "Dependency error indicates we may be missing filelists. Let's try "
-                    "again with filelists."
-                )
+    try:
+        with rpmdb(arch) as root_dir:
+            for download_filelists in [False, True]:
+                try:
+                    packages, sources, module_metadata = resolver(
+                        arch,
+                        root_dir,
+                        repos,
+                        packages,
+                        allow_erasing,
+                        reinstall_packages,
+                        module_enable,
+                        module_disable,
+                        no_sources,
+                        install_weak_deps,
+                        upgrade_packages,
+                        download_filelists=download_filelists,
+                        zchunk=zchunk,
+                        assume_provides=assume_provides,
+                        match_context_versions=match_context_versions,
+                    )
+                    break
+                except MissingFilelists:
+                    logger.error(
+                        "Dependency error indicates we may be missing filelists. Let's try "
+                        "again with filelists."
+                    )
+    finally:
+        log_timing("arch_total", arch_started, arch)
 
     return {
         "arch": arch,
@@ -643,10 +676,13 @@ def main():
             f"Only current architecture ({platform.machine()}) can be resolved against local system.",
         )
 
+    phase_started = time.perf_counter()
     repos = collect_content_origins(config_dir, config["contentOrigin"], variables)
+    log_timing("content_origin", phase_started)
 
     cf_pkgs = ContainerfilePackages()
 
+    phase_started = time.perf_counter()
     # Determine rpmdb source — independent of package extraction.
     containerfile = None
     is_image_context = True
@@ -729,6 +765,8 @@ def main():
             source_dir = Path(containerfile).parent
             builddep_resolved = resolve_builddep_packages(cf_pkgs.builddep, source_dir)
             cf_pkgs.common |= builddep_resolved
+
+    log_timing("context_and_packages", phase_started)
 
     if config.get("matchContextVersions") and not is_image_context:
         parser.error(
